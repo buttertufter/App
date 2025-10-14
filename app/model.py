@@ -222,7 +222,7 @@ def compute_modules(
         sigma_R = 0.0
     tau = 0.08
 
-    ocf_source = OCF_ttm.fillna(method="ffill")
+    ocf_source = OCF_ttm.ffill()  # Using ffill() instead of fillna(method="ffill")
     if ocf_source.dropna().shape[0] >= Wq_eff:
         dln_ocf = slope_log(ocf_source, window=Wq_eff)
     else:

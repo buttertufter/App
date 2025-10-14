@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 from typing import List
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -56,7 +57,7 @@ HISTORY_PRESETS = {
     "3y (12q)": {"quarters": 12, "years": 3},
     "5y (20q)": {"quarters": 20, "years": 5},
     "10y (40q)": {"quarters": 40, "years": 10},
-    "Max": {"quarters": None, "years": 15},
+    "Max (All Data)": {"quarters": None, "years": None},  # Use ALL available data
 }
 
 UNIVERSE_DF = get_universe()
@@ -142,13 +143,13 @@ with col_main:
     history_choice = st.selectbox(
         "History",
         list(HISTORY_PRESETS.keys()),
-        index=1,
-        help="Controls how many recent quarters are analysed.",
+        index=4,  # Default to "Max (All Data)"
+        help="Controls how many recent quarters are analysed. Use 'Max (All Data)' for complete historical analysis.",
     )
     force_refresh = st.checkbox(
-        "Force refresh fundamentals (ignore cache)",
+        "🔄 Force refresh data (ignore cache)",
         value=False,
-        help="Bypass cached data and fetch fresh results.",
+        help="⚠️ Check this to fetch fresh data from APIs. Otherwise cached data (up to 30 days old) will be used. IMPORTANT: If you're seeing limited data, enable this!",
     )
     if OFFLINE_MODE and force_refresh:
         st.warning("Offline mode: force refresh disabled.")
@@ -163,8 +164,17 @@ with col_peers:
 
 symbol = manual_symbol or label_to_symbol.get(selected, selected.split("—")[0].strip().upper())
 config = HISTORY_PRESETS[history_choice]
-max_quarters = config["quarters"]
-price_years = config["years"] or 15
+max_quarters = config["quarters"]  # None means use all available
+price_years = config["years"] if config["years"] is not None else 20  # Default to 20 years if None
+
+# Show cache status after symbol is defined
+if not force_refresh and symbol:
+    from data import _local_path, _is_fresh
+    cache_path = _local_path("quarterlies", symbol, "csv")
+    if _is_fresh(cache_path):
+        from utils import file_age_days
+        age = file_age_days(cache_path)
+        st.caption(f"ℹ️ Using cached data ({age:.0f} days old). Check '🔄 Force refresh' for latest data.")
 
 advanced = st.expander("Advanced parameters")
 with advanced:
@@ -373,81 +383,153 @@ if run:
     else:
         st.write("No qualitative tags surfaced for this run.")
 
-    st.subheader("Revenue & Cash Flow Analysis")
+    st.subheader("📊 Financial Performance Analysis")
     
     if not q_fin.empty:
-        # Show data overview and debugging information
-        st.write("### Data Availability")
-        col1, col2 = st.columns(2)
-        
+        # Show data overview with prominent warning if data is limited
+        col1, col2, col3 = st.columns(3)
         with col1:
-            available_quarters = len(q_fin)
-            date_range = f"{q_fin.index.min().strftime('%Y-%m-%d')} to {q_fin.index.max().strftime('%Y-%m-%d')}"
-            st.info(f"Financial data available: {available_quarters} quarters\n{date_range}")
-        
+            quarters_available = len(q_fin)
+            st.metric("Quarters Available", quarters_available)
+            # Warning if data seems limited
+            if quarters_available < 10:
+                st.warning(f"⚠️ Only {quarters_available} quarters found. Enable '🔄 Force refresh data' above to fetch more historical data from Finnhub API (~35+ quarters).")
         with col2:
-            st.write("Data Points:")
-            st.write(f"• Total quarters: {len(q_fin)}")
-            st.write(f"• Start date: {q_fin.index.min().strftime('%Y-%m-%d')}")
-            st.write(f"• End date: {q_fin.index.max().strftime('%Y-%m-%d')}")
-        
-        # Debug data
-        with st.expander("Debug: Raw Data Information"):
-            st.write("Data Shape:", q_fin.shape)
-            st.write("Available Columns:", list(q_fin.columns))
-            st.write("\nQuarterly Data Sample:")
-            st.dataframe(q_fin[["Revenue", "OperatingCashFlow"]].sort_index())
+            st.metric("Start Date", q_fin.index.min().strftime('%Y-%m-%d'))
+        with col3:
+            st.metric("End Date", q_fin.index.max().strftime('%Y-%m-%d'))
             
         # Display data source info
         if warnings:
-            with st.expander("Data Source Information"):
+            with st.expander("📁 Data Source Information"):
                 for warning in warnings:
                     if "data:" in warning:
-                        st.write(f"- {warning}")
+                        st.write(f"✓ {warning}")
         
-        # Create financial data frame
-        fin_data = q_fin[["Revenue", "OperatingCashFlow"]].copy()
+        # Prepare financial data
+        fin_data = q_fin.copy()
         fin_data.index = pd.to_datetime(fin_data.index)
         fin_data = fin_data.sort_index()
         
-        # Calculate TTM values
+        # Calculate TTM (Trailing Twelve Months) values
         ttm_data = pd.DataFrame(index=fin_data.index)
-        for col in ["Revenue", "OperatingCashFlow"]:
-            # Calculate TTM (Trailing Twelve Months)
-            ttm_data[f"{col} (TTM)"] = fin_data[col].rolling(4, min_periods=4).sum()
-            # Calculate growth from first period
-            first_ttm = ttm_data[f"{col} (TTM)"].dropna().iloc[0]
-            if first_ttm and first_ttm != 0:
-                ttm_data[f"{col} Growth"] = ttm_data[f"{col} (TTM)"] / first_ttm
+        for col in ["Revenue", "OperatingCashFlow", "OperatingExpenses"]:
+            if col in fin_data.columns:
+                ttm_data[col] = fin_data[col].rolling(4, min_periods=1).sum()
         
-        # Display TTM Values
-        if not ttm_data.empty:
-            st.subheader("Trailing Twelve Months (TTM) Values")
-            ttm_values = ttm_data[[c for c in ttm_data.columns if "TTM" in c]].copy()
-            for col in ttm_values.columns:
-                ttm_values[col] = ttm_values[col] / 1e9  # Convert to billions
-                ttm_values = ttm_values.rename(columns={col: f"{col} $B"})
-            st.line_chart(ttm_values)
-            
-            # Display Growth Metrics
-            st.subheader("Growth Since First Period")
-            growth_cols = [c for c in ttm_data.columns if "Growth" in c]
-            if growth_cols:
-                st.line_chart(ttm_data[growth_cols])
-            
-            # Show latest values
-            latest = ttm_data.iloc[-1]
-            st.caption(
-                "Latest metrics (most recent quarter):\\n" +
-                "\\n".join([
-                    f"• {col.replace(' (TTM)', '')}: {val:.2f}{'x' if 'Growth' in col else 'B'}" 
-                    for col, val in latest.dropna().items()
-                ])
-            )
+        # Calculate key financial ratios
+        metrics_data = pd.DataFrame(index=fin_data.index)
         
-        # Raw data analysis in expander
-        with st.expander("View Raw Financial Data"):
-            st.dataframe(fin_data)
+        # 1. Operating Cash Flow to Revenue Ratio (Cash Conversion)
+        if "Revenue" in ttm_data.columns and "OperatingCashFlow" in ttm_data.columns:
+            metrics_data["OCF/Revenue %"] = (ttm_data["OperatingCashFlow"] / ttm_data["Revenue"] * 100).replace([np.inf, -np.inf], np.nan)
+        
+        # 2. Operating Margin
+        if "Revenue" in ttm_data.columns and "OperatingExpenses" in ttm_data.columns:
+            metrics_data["Operating Margin %"] = ((ttm_data["Revenue"] - ttm_data["OperatingExpenses"]) / ttm_data["Revenue"] * 100).replace([np.inf, -np.inf], np.nan)
+        
+        # 3. Cash to Debt Ratio (Liquidity)
+        if "Cash" in fin_data.columns and "Debt" in fin_data.columns:
+            metrics_data["Cash/Debt Ratio"] = (fin_data["Cash"] / fin_data["Debt"].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+        
+        # 4. Net Debt (Debt - Cash)
+        if "Cash" in fin_data.columns and "Debt" in fin_data.columns:
+            metrics_data["Net Debt ($B)"] = (fin_data["Debt"] - fin_data["Cash"]) / 1e9
+        
+        # 5. Revenue Growth Rate (YoY)
+        if "Revenue" in ttm_data.columns:
+            metrics_data["Revenue Growth %"] = (ttm_data["Revenue"].pct_change(4) * 100).replace([np.inf, -np.inf], np.nan)
+        
+        # 6. Cash Flow Growth Rate (YoY)
+        if "OperatingCashFlow" in ttm_data.columns:
+            metrics_data["OCF Growth %"] = (ttm_data["OperatingCashFlow"].pct_change(4) * 100).replace([np.inf, -np.inf], np.nan)
+        
+        # Chart 1: Revenue and Operating Cash Flow (TTM)
+        st.subheader("💰 Revenue & Operating Cash Flow (TTM)")
+        chart1_data = pd.DataFrame()
+        if "Revenue" in ttm_data.columns:
+            chart1_data["Revenue ($B)"] = ttm_data["Revenue"] / 1e9
+        if "OperatingCashFlow" in ttm_data.columns:
+            chart1_data["Operating Cash Flow ($B)"] = ttm_data["OperatingCashFlow"] / 1e9
+        if not chart1_data.empty:
+            st.line_chart(chart1_data)
+        
+        # Chart 2: Profitability Metrics
+        st.subheader("📈 Profitability & Efficiency Metrics")
+        chart2_data = pd.DataFrame()
+        if "OCF/Revenue %" in metrics_data.columns:
+            chart2_data["Cash Conversion %"] = metrics_data["OCF/Revenue %"]
+        if "Operating Margin %" in metrics_data.columns:
+            chart2_data["Operating Margin %"] = metrics_data["Operating Margin %"]
+        if not chart2_data.empty:
+            st.line_chart(chart2_data)
+            col1, col2 = st.columns(2)
+            with col1:
+                latest_conv = chart2_data["Cash Conversion %"].dropna().iloc[-1] if "Cash Conversion %" in chart2_data.columns else 0
+                st.metric("Latest Cash Conversion", f"{latest_conv:.1f}%", 
+                         help="Operating Cash Flow / Revenue. Higher is better (>20% is good)")
+            with col2:
+                latest_margin = chart2_data["Operating Margin %"].dropna().iloc[-1] if "Operating Margin %" in chart2_data.columns else 0
+                st.metric("Latest Operating Margin", f"{latest_margin:.1f}%",
+                         help="(Revenue - Operating Expenses) / Revenue. Higher is better")
+        
+        # Chart 3: Growth Rates
+        st.subheader("🚀 Year-over-Year Growth Rates")
+        chart3_data = pd.DataFrame()
+        if "Revenue Growth %" in metrics_data.columns:
+            chart3_data["Revenue Growth %"] = metrics_data["Revenue Growth %"]
+        if "OCF Growth %" in metrics_data.columns:
+            chart3_data["OCF Growth %"] = metrics_data["OCF Growth %"]
+        if not chart3_data.empty:
+            st.line_chart(chart3_data)
+        
+        # Chart 4: Balance Sheet Health
+        st.subheader("💼 Balance Sheet Health")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Cash vs Debt
+            chart4a_data = pd.DataFrame()
+            if "Cash" in fin_data.columns:
+                chart4a_data["Cash ($B)"] = fin_data["Cash"] / 1e9
+            if "Debt" in fin_data.columns:
+                chart4a_data["Debt ($B)"] = fin_data["Debt"] / 1e9
+            if not chart4a_data.empty:
+                st.line_chart(chart4a_data)
+        
+        with col2:
+            # Net Debt and Cash/Debt Ratio
+            chart4b_data = pd.DataFrame()
+            if "Net Debt ($B)" in metrics_data.columns:
+                chart4b_data["Net Debt ($B)"] = metrics_data["Net Debt ($B)"]
+            if "Cash/Debt Ratio" in metrics_data.columns:
+                chart4b_data["Cash/Debt Ratio"] = metrics_data["Cash/Debt Ratio"]
+            if not chart4b_data.empty:
+                st.line_chart(chart4b_data)
+        
+        # Key Metrics Summary
+        st.subheader("📊 Latest Quarter Metrics Summary")
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            latest_revenue = (ttm_data["Revenue"].iloc[-1] / 1e9) if "Revenue" in ttm_data.columns else 0
+            st.metric("Revenue (TTM)", f"${latest_revenue:.2f}B")
+        
+        with col2:
+            latest_ocf = (ttm_data["OperatingCashFlow"].iloc[-1] / 1e9) if "OperatingCashFlow" in ttm_data.columns else 0
+            st.metric("Operating Cash Flow", f"${latest_ocf:.2f}B")
+        
+        with col3:
+            latest_cash = (fin_data["Cash"].iloc[-1] / 1e9) if "Cash" in fin_data.columns else 0
+            st.metric("Cash", f"${latest_cash:.2f}B")
+        
+        with col4:
+            latest_debt = (fin_data["Debt"].iloc[-1] / 1e9) if "Debt" in fin_data.columns else 0
+            st.metric("Debt", f"${latest_debt:.2f}B")
+        
+        # Raw data in expander
+        with st.expander("🔍 View Raw Financial Data"):
+            st.dataframe(fin_data.sort_index(ascending=False))
             st.write("### Summary Statistics")
             st.dataframe(fin_data.describe())
     else:

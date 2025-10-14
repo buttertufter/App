@@ -159,70 +159,210 @@ def sector_etf_map() -> Dict[str, str]:
 
 
 def _fetch_fmp_quarterlies(symbol: str) -> pd.DataFrame:
-    """Fetch quarterly financial data from Financial Modeling Prep API."""
+    """Fetch up to 400 quarters of financial data from FMP (Financial Modeling Prep)."""
     if not FMP_API_KEY:
         print("No FMP API key found")
         return pd.DataFrame()
     
     print(f"\n=== Fetching FMP data for {symbol} ===")
     try:
+        base_url = "https://financialmodelingprep.com/api/v3"
+        params = {"apikey": FMP_API_KEY, "limit": 400}
+        
         # Fetch income statement
-        income_url = f"https://financialmodelingprep.com/api/v3/income-statement/{symbol}?period=quarter&limit=400&apikey={FMP_API_KEY}"
-        balance_url = f"https://financialmodelingprep.com/api/v3/balance-sheet-statement/{symbol}?period=quarter&limit=400&apikey={FMP_API_KEY}"
-        cashflow_url = f"https://financialmodelingprep.com/api/v3/cash-flow-statement/{symbol}?period=quarter&limit=400&apikey={FMP_API_KEY}"
-        
-        income_resp = SESSION.get(income_url)
-        income_data = income_resp.json()
-        print(f"\nFMP Income Statement:")
-        print(f"Response: {income_resp.status_code}")
-        if isinstance(income_data, list):
-            print(f"Quarters: {len(income_data)}")
-            if len(income_data) > 0:
-                print(f"Date range: {income_data[-1].get('date', 'N/A')} to {income_data[0].get('date', 'N/A')}")
-        
-        balance_resp = SESSION.get(balance_url)
-        balance_data = balance_resp.json()
-        print(f"\nFMP Balance Sheet:")
-        print(f"Response: {balance_resp.status_code}")
-        if isinstance(balance_data, list):
-            print(f"Quarters: {len(balance_data)}")
-            if len(balance_data) > 0:
-                print(f"Date range: {balance_data[-1].get('date', 'N/A')} to {balance_data[0].get('date', 'N/A')}")
-        
-        cashflow_resp = SESSION.get(cashflow_url)
-        cashflow_data = cashflow_resp.json()
-        print(f"\nFMP Cash Flow:")
-        print(f"Response: {cashflow_resp.status_code}")
-        if isinstance(cashflow_data, list):
-            print(f"Quarters: {len(cashflow_data)}")
-            if len(cashflow_data) > 0:
-                print(f"Date range: {cashflow_data[-1].get('date', 'N/A')} to {cashflow_data[0].get('date', 'N/A')}")
-        
-        # Convert to DataFrames
-        income_df = pd.DataFrame(income_data).set_index('date') if isinstance(income_data, list) and income_data else pd.DataFrame()
-        balance_df = pd.DataFrame(balance_data).set_index('date') if isinstance(balance_data, list) and balance_data else pd.DataFrame()
-        cashflow_df = pd.DataFrame(cashflow_data).set_index('date') if isinstance(cashflow_data, list) and cashflow_data else pd.DataFrame()
-        
-        if income_df.empty and balance_df.empty:
+        income_url = f"{base_url}/income-statement/{symbol}"
+        income_resp = SESSION.get(income_url, params={**params, "period": "quarter"})
+        print(f"FMP Income Statement: Response: {income_resp.status_code}")
+        if income_resp.status_code == 403:
+            print(f"FMP API key may be invalid or expired. Consider checking your subscription at https://financialmodelingprep.com/")
+            print(f"Response: {income_resp.text[:200]}")
             return pd.DataFrame()
         
-        # Get all dates and sort
-        all_dates = sorted(set(income_df.index) | set(balance_df.index) | set(cashflow_df.index))
+        # Fetch balance sheet
+        balance_url = f"{base_url}/balance-sheet-statement/{symbol}"
+        balance_resp = SESSION.get(balance_url, params={**params, "period": "quarter"})
+        print(f"FMP Balance Sheet: Response: {balance_resp.status_code}")
+        if balance_resp.status_code == 403:
+            return pd.DataFrame()
         
-        # Create final dataframe
-        result = pd.DataFrame(index=all_dates)
-        result.index = pd.to_datetime(result.index)
+        # Fetch cash flow
+        cashflow_url = f"{base_url}/cash-flow-statement/{symbol}"
+        cashflow_resp = SESSION.get(cashflow_url, params={**params, "period": "quarter"})
+        print(f"FMP Cash Flow: Response: {cashflow_resp.status_code}")
+        if cashflow_resp.status_code == 403:
+            return pd.DataFrame()
         
-        # Map FMP fields to our standard names
-        result['Revenue'] = income_df['revenue'] if not income_df.empty else np.nan
-        result['OperatingExpenses'] = income_df['operatingExpenses'] if not income_df.empty else np.nan
-        result['OperatingCashFlow'] = cashflow_df['operatingCashFlow'] if not cashflow_df.empty else np.nan
-        result['Cash'] = balance_df['cashAndCashEquivalents'] if not balance_df.empty else np.nan
-        result['Debt'] = balance_df['totalDebt'] if not balance_df.empty else np.nan
+        # Parse responses
+        income_data = income_resp.json() if income_resp.status_code == 200 else []
+        balance_data = balance_resp.json() if balance_resp.status_code == 200 else []
+        cashflow_data = cashflow_resp.json() if cashflow_resp.status_code == 200 else []
         
-        return result.sort_index()
+        if not income_data:
+            print("No income data from FMP")
+            return pd.DataFrame()
+        
+        # Create dictionaries indexed by date for easy merging
+        balance_dict = {item['date']: item for item in balance_data} if balance_data else {}
+        cashflow_dict = {item['date']: item for item in cashflow_data} if cashflow_data else {}
+        
+        # Combine all data
+        quarters = []
+        for income in income_data:
+            date = income.get('date')
+            if not date:
+                continue
+                
+            balance = balance_dict.get(date, {})
+            cashflow = cashflow_dict.get(date, {})
+            
+            quarter_data = {
+                'date': date,
+                'Revenue': income.get('revenue', np.nan),
+                'OperatingExpenses': income.get('operatingExpenses', np.nan),
+                'OperatingCashFlow': cashflow.get('operatingCashFlow', np.nan),
+                'Cash': balance.get('cashAndCashEquivalents', np.nan),
+                'Debt': balance.get('totalDebt', np.nan)
+            }
+            quarters.append(quarter_data)
+        
+        if not quarters:
+            print("No quarterly data parsed from FMP")
+            return pd.DataFrame()
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(quarters)
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.set_index('date').sort_index()
+        
+        print(f"FMP data retrieved:")
+        print(f"Quarters: {len(df)}")
+        print(f"Date range: {df.index.min()} to {df.index.max()}")
+        print(f"Columns: {list(df.columns)}")
+        
+        return df
+        
     except Exception as e:
         print(f"FMP API error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return pd.DataFrame()
+
+def _fetch_finnhub_quarterlies(symbol: str) -> pd.DataFrame:
+    """Fetch quarterly financial data from Finnhub."""
+    if not FINNHUB_API_KEY:
+        print("No Finnhub API key found")
+        return pd.DataFrame()
+    
+    print(f"\n=== Fetching Finnhub data for {symbol} ===")
+    try:
+        # Construct API URLs for different financial statements
+        base_url = "https://finnhub.io/api/v1"
+        headers = {"X-Finnhub-Token": FINNHUB_API_KEY}
+        
+        # Fetch income statement (up to 4 years of quarterly data)
+        income_url = f"{base_url}/stock/financials-reported?symbol={symbol}&freq=quarterly"
+        income_resp = SESSION.get(income_url, headers=headers)
+        print(f"Income statement response: {income_resp.status_code}")
+        
+        if income_resp.status_code != 200:
+            print(f"Finnhub API error: {income_resp.text}")
+            return pd.DataFrame()
+            
+        response_data = income_resp.json()
+        print(f"Finnhub response keys: {list(response_data.keys())}")
+        
+        data = response_data.get('data', [])
+        if not data:
+            print(f"No data returned from Finnhub. Full response: {response_data}")
+            return pd.DataFrame()
+        
+        print(f"Number of reports: {len(data)}")
+            
+        # Process the quarterly reports
+        quarters = []
+        for i, report in enumerate(data):
+            report_date = report.get('endDate') or report.get('period') or report.get('year')
+            if not report_date:
+                continue
+                
+            # Try to get the report structure
+            report_obj = report.get('report', {})
+            if not report_obj:
+                continue
+                
+            # Look for different possible statement keys
+            statement = report_obj.get('ic', []) or report_obj.get('is', [])  # Income statement
+            bs = report_obj.get('bs', [])  # Balance sheet
+            cf = report_obj.get('cf', [])  # Cash flow
+            
+            # Parse list-based data structure
+            def find_value(statement_list, labels):
+                if not isinstance(statement_list, list):
+                    return np.nan
+                for item in statement_list:
+                    if isinstance(item, dict):
+                        item_label = item.get('label', '')
+                        if item_label in labels:
+                            return item.get('value', np.nan)
+                return np.nan
+            
+            quarter_data = {
+                'date': report_date,
+                'Revenue': find_value(statement, ['Revenue', 'Revenues', 'Total Revenue']),
+                'OperatingExpenses': find_value(statement, [
+                    'Operating Expenses', 
+                    'Operating expenses',
+                    'Total operating expenses',
+                    'Research and Development Expense, Total',
+                    'Selling and Marketing Expense, Total',
+                    'General and Administrative Expense, Total'
+                ]),
+                'OperatingCashFlow': find_value(cf, [
+                    'Net Cash Provided by (Used in) Operating Activities',
+                    'Net cash from operating activities',
+                    'Operating Cash Flow',
+                    'Cash flows from operating activities'
+                ]),
+                'Cash': find_value(bs, [
+                    'Cash and Cash Equivalents, at Carrying Value, Total',
+                    'Cash and cash equivalents',
+                    'Cash'
+                ]),
+                'Debt': find_value(bs, [
+                    'Long-Term Debt, Total',
+                    'Long-term debt',
+                    'Total debt',
+                    'Debt, Total'
+                ])
+            }
+            quarters.append(quarter_data)
+        
+        if not quarters:
+            print("No quarterly data found in Finnhub response")
+            return pd.DataFrame()
+            
+        # Convert to DataFrame
+        df = pd.DataFrame(quarters)
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.set_index('date').sort_index()
+        
+        # Drop rows where all financial data is NaN
+        df = df.dropna(how='all', subset=['Revenue', 'OperatingExpenses', 'OperatingCashFlow', 'Cash', 'Debt'])
+        
+        if not df.empty:
+            print(f"Finnhub data retrieved:")
+            print(f"Quarters: {len(df)}")
+            print(f"Date range: {df.index.min()} to {df.index.max()}")
+            print(f"Columns: {list(df.columns)}")
+        else:
+            print("All Finnhub data was NaN after parsing")
+        
+        return df
+        
+    except Exception as e:
+        print(f"Finnhub API error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return pd.DataFrame()
 
 def _fetch_yahoo_quarterlies(symbol: str) -> pd.DataFrame:
@@ -246,8 +386,8 @@ def _fetch_yahoo_quarterlies(symbol: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     index = income.index
-    for df in (balance.index if not balance.empty else [], cashflow.index if not cashflow.empty else []):
-        index = index.union(df)
+    for df_index in (balance.index if not balance.empty else [], cashflow.index if not cashflow.empty else []):
+        index = index.union(df_index)
     index = index.sort_values()
 
     def pick(df: pd.DataFrame, names: Sequence[str]) -> pd.Series:
@@ -324,64 +464,82 @@ def fetch_quarterlies(
                 return df, warnings
         raise ValueError(f"Offline mode: no local fundamentals for {symbol}.")
 
-    # Initialize empty DataFrame to store merged data
-    merged_df = pd.DataFrame()
+    dfs = []
     
     # Get FMP data
     try:
         fmp_df = _fetch_fmp_quarterlies(symbol)
         if not fmp_df.empty:
+            print(f"\nFMP Data loaded:")
+            print(f"Shape: {fmp_df.shape}")
+            print(f"Columns: {list(fmp_df.columns)}")
+            print(f"Date range: {fmp_df.index.min()} to {fmp_df.index.max()}")
             warnings.append(f"FMP data: {len(fmp_df)} quarters ({fmp_df.index.min()} to {fmp_df.index.max()})")
-            merged_df = merged_df._append(fmp_df)
+            dfs.append(fmp_df)
     except Exception as exc:
+        print(f"FMP error: {exc}")
         warnings.append(f"FMP data fetch failed: {exc}")
     
+    # Get Finnhub data
+    try:
+        finnhub_df = _fetch_finnhub_quarterlies(symbol)
+        if not finnhub_df.empty:
+            print(f"\nFinnhub Data loaded:")
+            print(f"Shape: {finnhub_df.shape}")
+            print(f"Columns: {list(finnhub_df.columns)}")
+            print(f"Date range: {finnhub_df.index.min()} to {finnhub_df.index.max()}")
+            warnings.append(f"Finnhub data: {len(finnhub_df)} quarters ({finnhub_df.index.min()} to {finnhub_df.index.max()})")
+            dfs.append(finnhub_df)
+    except Exception as exc:
+        print(f"Finnhub error: {exc}")
+        warnings.append(f"Finnhub data fetch failed: {exc}")
+
     # Get Yahoo Finance data
     try:
         yahoo_df = _fetch_yahoo_quarterlies(symbol)
         if not yahoo_df.empty:
+            print(f"\nYahoo Data loaded:")
+            print(f"Shape: {yahoo_df.shape}")
+            print(f"Columns: {list(yahoo_df.columns)}")
+            print(f"Date range: {yahoo_df.index.min()} to {yahoo_df.index.max()}")
             warnings.append(f"Yahoo data: {len(yahoo_df)} quarters ({yahoo_df.index.min()} to {yahoo_df.index.max()})")
-            merged_df = merged_df._append(yahoo_df)
+            dfs.append(yahoo_df)
     except Exception as exc:
+        print(f"Yahoo error: {exc}")
         warnings.append(f"Yahoo data fetch failed: {exc}")
     
-    if not merged_df.empty:
-        # Remove any duplicate indices (dates) by keeping the first occurrence
+    if dfs:
+        # Merge all dataframes, preferring FMP data over Finnhub for duplicates
+        merged_df = pd.concat(dfs, axis=0, join='outer')
+        # Remove duplicates by date, preferring FMP data over Finnhub
         merged_df = merged_df[~merged_df.index.duplicated(keep='first')]
         # Sort by date
         merged_df = merged_df.sort_index()
-        # Fill missing values forward and backward within each source
-        merged_df = merged_df.fillna(method='ffill').fillna(method='bfill')
+        
+        # Ensure we have the required columns
+        merged_df = _ensure_columns(merged_df)
+        
+        print(f"\nMerged Data Summary:")
+        print(f"Total quarters: {len(merged_df)}")
+        print(f"Date range: {merged_df.index.min()} to {merged_df.index.max()}")
+        print(f"Columns: {list(merged_df.columns)}")
         
         warnings.append(f"Combined data: {len(merged_df)} quarters ({merged_df.index.min()} to {merged_df.index.max()})")
         
         # Apply max_quarters filter if specified
         if max_quarters:
             merged_df = merged_df.tail(max_quarters)
+            print(f"After max_quarters filter ({max_quarters}): {len(merged_df)} quarters")
         
         # Cache the merged data
         export = merged_df.reset_index()
+        export.rename(columns={'date': 'date'}, inplace=True)
         write_local_csv(export, local_path)
         
         return merged_df, warnings
     else:
         warnings.append(f"No quarterly fundamentals available for {symbol}.")
         return pd.DataFrame(), warnings
-
-    df = _ensure_columns(df)
-    df = df.dropna(how="all")
-    if max_quarters:
-        df = df.tail(max_quarters)
-
-    if df.dropna(how="all").shape[0] < 4:
-        raise ValueError(f"Quarterly data insufficient for {symbol} (need >=4 rows).")
-
-    # Fill with peer medians only for the primary stock request
-    df = fill_with_peer_medians(df, symbol, get_universe(), depth=0)
-
-    export = df.reset_index()
-    write_local_csv(export, local_path)
-    return df, warnings
 
 
 def fetch_prices(
