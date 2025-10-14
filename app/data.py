@@ -92,6 +92,25 @@ def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = np.nan
     return df[CANONICAL_COLUMNS]
 
+def fill_with_peer_medians(q_fin: pd.DataFrame, symbol: str, universe: pd.DataFrame) -> pd.DataFrame:
+    sector = universe.loc[universe["symbol"] == symbol, "sector"].values[0]
+    peers = universe[(universe["sector"] == sector) & (universe["symbol"] != symbol)]["symbol"].tolist()
+    peer_frames = []
+    for peer in peers:
+        try:
+            peer_df, _ = fetch_quarterlies(peer)
+            peer_frames.append(peer_df)
+        except Exception:
+            continue
+    if not peer_frames:
+        return q_fin
+    peer_concat = pd.concat(peer_frames)
+    medians = peer_concat.median()
+    for col in q_fin.columns:
+        if q_fin[col].isnull().all():
+            q_fin[col] = medians.get(col, 0)
+    return q_fin
+
 
 def get_universe() -> pd.DataFrame:
     universe_path = DATA_STORE / "universe.csv"
@@ -206,6 +225,8 @@ def fetch_quarterlies(
             df = _ensure_columns(df)
             if max_quarters:
                 df = df.tail(max_quarters)
+            # --- Add peer median fill here ---
+            df = fill_with_peer_medians(df, symbol, get_universe())
             return df, warnings
 
     if OFFLINE_MODE:
@@ -217,6 +238,8 @@ def fetch_quarterlies(
                 df = _ensure_columns(df)
                 if max_quarters:
                     df = df.tail(max_quarters)
+                # --- Add peer median fill here ---
+                df = fill_with_peer_medians(df, symbol, get_universe())
                 warnings.append("Offline mode: using stored fundamentals.")
                 return df, warnings
         raise ValueError(f"Offline mode: no local fundamentals for {symbol}.")
@@ -238,6 +261,9 @@ def fetch_quarterlies(
 
     if df.dropna(how="all").shape[0] < 4:
         raise ValueError(f"Quarterly data insufficient for {symbol} (need >=4 rows).")
+
+    # --- Add peer median fill here ---
+    df = fill_with_peer_medians(df, symbol, get_universe())
 
     export = df.reset_index()
     write_local_csv(export, local_path)
