@@ -88,10 +88,12 @@ def ticker_options():
 
 def score_to_color(score: float) -> str:
     pct = max(0.0, min(1.0, float(score)))
-    r = int(255 * (1 - pct))
-    g = int(180 * pct + 60 * (1 - pct))
-    b = int(120 * pct + 40 * (1 - pct))
-    return f"#{r:02x}{g:02x}{b:02x}"
+    if pct < 0.6:
+        return "#f87171"  # red
+    elif pct < 0.8:
+        return "#fbbf24"  # amber
+    else:
+        return "#34d399"  # green
 
 
 def render_gauge(label: str, score: float, blurb: str):
