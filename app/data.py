@@ -92,23 +92,35 @@ def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = np.nan
     return df[CANONICAL_COLUMNS]
 
-def fill_with_peer_medians(q_fin: pd.DataFrame, symbol: str, universe: pd.DataFrame) -> pd.DataFrame:
+def fill_with_peer_medians(q_fin: pd.DataFrame, symbol: str, universe: pd.DataFrame, depth: int = 0) -> pd.DataFrame:
+    if depth > 0:  # Don't fetch peer data for peers (avoid recursion)
+        return q_fin
+        
     sector = universe.loc[universe["symbol"] == symbol, "sector"].values[0]
     peers = universe[(universe["sector"] == sector) & (universe["symbol"] != symbol)]["symbol"].tolist()
     peer_frames = []
+    
     for peer in peers:
         try:
-            peer_df, _ = fetch_quarterlies(peer)
-            peer_frames.append(peer_df)
+            local_path = _local_path("quarterlies", peer, "csv")
+            if local_path.exists():
+                df = read_local_csv(local_path)
+                if not df.empty:
+                    df.index = pd.to_datetime(df["date"]) if "date" in df.columns else df.index
+                    peer_frames.append(df)
         except Exception:
             continue
+            
     if not peer_frames:
         return q_fin
+        
     peer_concat = pd.concat(peer_frames)
     medians = peer_concat.median()
+    
     for col in q_fin.columns:
         if q_fin[col].isnull().all():
             q_fin[col] = medians.get(col, 0)
+    
     return q_fin
 
 
@@ -146,14 +158,86 @@ def sector_etf_map() -> Dict[str, str]:
     }
 
 
+def _fetch_fmp_quarterlies(symbol: str) -> pd.DataFrame:
+    """Fetch quarterly financial data from Financial Modeling Prep API."""
+    if not FMP_API_KEY:
+        print("No FMP API key found")
+        return pd.DataFrame()
+    
+    print(f"\n=== Fetching FMP data for {symbol} ===")
+    try:
+        # Fetch income statement
+        income_url = f"https://financialmodelingprep.com/api/v3/income-statement/{symbol}?period=quarter&limit=400&apikey={FMP_API_KEY}"
+        balance_url = f"https://financialmodelingprep.com/api/v3/balance-sheet-statement/{symbol}?period=quarter&limit=400&apikey={FMP_API_KEY}"
+        cashflow_url = f"https://financialmodelingprep.com/api/v3/cash-flow-statement/{symbol}?period=quarter&limit=400&apikey={FMP_API_KEY}"
+        
+        income_resp = SESSION.get(income_url)
+        income_data = income_resp.json()
+        print(f"\nFMP Income Statement:")
+        print(f"Response: {income_resp.status_code}")
+        if isinstance(income_data, list):
+            print(f"Quarters: {len(income_data)}")
+            if len(income_data) > 0:
+                print(f"Date range: {income_data[-1].get('date', 'N/A')} to {income_data[0].get('date', 'N/A')}")
+        
+        balance_resp = SESSION.get(balance_url)
+        balance_data = balance_resp.json()
+        print(f"\nFMP Balance Sheet:")
+        print(f"Response: {balance_resp.status_code}")
+        if isinstance(balance_data, list):
+            print(f"Quarters: {len(balance_data)}")
+            if len(balance_data) > 0:
+                print(f"Date range: {balance_data[-1].get('date', 'N/A')} to {balance_data[0].get('date', 'N/A')}")
+        
+        cashflow_resp = SESSION.get(cashflow_url)
+        cashflow_data = cashflow_resp.json()
+        print(f"\nFMP Cash Flow:")
+        print(f"Response: {cashflow_resp.status_code}")
+        if isinstance(cashflow_data, list):
+            print(f"Quarters: {len(cashflow_data)}")
+            if len(cashflow_data) > 0:
+                print(f"Date range: {cashflow_data[-1].get('date', 'N/A')} to {cashflow_data[0].get('date', 'N/A')}")
+        
+        # Convert to DataFrames
+        income_df = pd.DataFrame(income_data).set_index('date') if isinstance(income_data, list) and income_data else pd.DataFrame()
+        balance_df = pd.DataFrame(balance_data).set_index('date') if isinstance(balance_data, list) and balance_data else pd.DataFrame()
+        cashflow_df = pd.DataFrame(cashflow_data).set_index('date') if isinstance(cashflow_data, list) and cashflow_data else pd.DataFrame()
+        
+        if income_df.empty and balance_df.empty:
+            return pd.DataFrame()
+        
+        # Get all dates and sort
+        all_dates = sorted(set(income_df.index) | set(balance_df.index) | set(cashflow_df.index))
+        
+        # Create final dataframe
+        result = pd.DataFrame(index=all_dates)
+        result.index = pd.to_datetime(result.index)
+        
+        # Map FMP fields to our standard names
+        result['Revenue'] = income_df['revenue'] if not income_df.empty else np.nan
+        result['OperatingExpenses'] = income_df['operatingExpenses'] if not income_df.empty else np.nan
+        result['OperatingCashFlow'] = cashflow_df['operatingCashFlow'] if not cashflow_df.empty else np.nan
+        result['Cash'] = balance_df['cashAndCashEquivalents'] if not balance_df.empty else np.nan
+        result['Debt'] = balance_df['totalDebt'] if not balance_df.empty else np.nan
+        
+        return result.sort_index()
+    except Exception as e:
+        print(f"FMP API error: {str(e)}")
+        return pd.DataFrame()
+
 def _fetch_yahoo_quarterlies(symbol: str) -> pd.DataFrame:
+    print(f"\n=== Fetching Yahoo Finance data for {symbol} ===")
     ticker = yf.Ticker(symbol)
     def frame(tbl: Optional[pd.DataFrame]) -> pd.DataFrame:
         if tbl is None or tbl.empty:
             return pd.DataFrame()
         df = tbl.transpose()
         df.index = pd.to_datetime(df.index, errors="coerce")
-        return df.dropna(how="all")
+        df = df.dropna(how="all")
+        print(f"Quarters: {len(df)}")
+        if not df.empty:
+            print(f"Date range: {df.index.min()} to {df.index.max()}")
+        return df
 
     income = frame(ticker.quarterly_financials)
     balance = frame(ticker.quarterly_balance_sheet)
@@ -225,8 +309,6 @@ def fetch_quarterlies(
             df = _ensure_columns(df)
             if max_quarters:
                 df = df.tail(max_quarters)
-            # --- Add peer median fill here ---
-            df = fill_with_peer_medians(df, symbol, get_universe())
             return df, warnings
 
     if OFFLINE_MODE:
@@ -238,21 +320,53 @@ def fetch_quarterlies(
                 df = _ensure_columns(df)
                 if max_quarters:
                     df = df.tail(max_quarters)
-                # --- Add peer median fill here ---
-                df = fill_with_peer_medians(df, symbol, get_universe())
                 warnings.append("Offline mode: using stored fundamentals.")
                 return df, warnings
         raise ValueError(f"Offline mode: no local fundamentals for {symbol}.")
 
+    # Initialize empty DataFrame to store merged data
+    merged_df = pd.DataFrame()
+    
+    # Get FMP data
+    try:
+        fmp_df = _fetch_fmp_quarterlies(symbol)
+        if not fmp_df.empty:
+            warnings.append(f"FMP data: {len(fmp_df)} quarters ({fmp_df.index.min()} to {fmp_df.index.max()})")
+            merged_df = merged_df._append(fmp_df)
+    except Exception as exc:
+        warnings.append(f"FMP data fetch failed: {exc}")
+    
+    # Get Yahoo Finance data
     try:
         yahoo_df = _fetch_yahoo_quarterlies(symbol)
+        if not yahoo_df.empty:
+            warnings.append(f"Yahoo data: {len(yahoo_df)} quarters ({yahoo_df.index.min()} to {yahoo_df.index.max()})")
+            merged_df = merged_df._append(yahoo_df)
     except Exception as exc:
-        warnings.append(f"Yahoo quarterlies failed: {exc}")
-        yahoo_df = pd.DataFrame()
-
-    df = yahoo_df
-    if df.empty:
-        raise ValueError(f"No quarterly fundamentals available for {symbol}.")
+        warnings.append(f"Yahoo data fetch failed: {exc}")
+    
+    if not merged_df.empty:
+        # Remove any duplicate indices (dates) by keeping the first occurrence
+        merged_df = merged_df[~merged_df.index.duplicated(keep='first')]
+        # Sort by date
+        merged_df = merged_df.sort_index()
+        # Fill missing values forward and backward within each source
+        merged_df = merged_df.fillna(method='ffill').fillna(method='bfill')
+        
+        warnings.append(f"Combined data: {len(merged_df)} quarters ({merged_df.index.min()} to {merged_df.index.max()})")
+        
+        # Apply max_quarters filter if specified
+        if max_quarters:
+            merged_df = merged_df.tail(max_quarters)
+        
+        # Cache the merged data
+        export = merged_df.reset_index()
+        write_local_csv(export, local_path)
+        
+        return merged_df, warnings
+    else:
+        warnings.append(f"No quarterly fundamentals available for {symbol}.")
+        return pd.DataFrame(), warnings
 
     df = _ensure_columns(df)
     df = df.dropna(how="all")
@@ -262,8 +376,8 @@ def fetch_quarterlies(
     if df.dropna(how="all").shape[0] < 4:
         raise ValueError(f"Quarterly data insufficient for {symbol} (need >=4 rows).")
 
-    # --- Add peer median fill here ---
-    df = fill_with_peer_medians(df, symbol, get_universe())
+    # Fill with peer medians only for the primary stock request
+    df = fill_with_peer_medians(df, symbol, get_universe(), depth=0)
 
     export = df.reset_index()
     write_local_csv(export, local_path)
@@ -304,7 +418,11 @@ def fetch_prices(
     data = yf.download(symbol, start=start, end=end, interval=interval, progress=False)
     if data.empty or "Close" not in data.columns:
         raise ValueError(f"No price data for {symbol}")
-    series = data["Close"].dropna().rename(str(symbol))
+    
+    # Convert to series and ensure 1D
+    series = pd.Series(data["Close"].values.flatten(), index=data.index, name=str(symbol))
+    series = series.dropna()
+    
     export = pd.DataFrame({"date": series.index, "close": series.values})
     write_local_csv(export, local_path)
     return series, warnings
@@ -420,7 +538,20 @@ def fetch_estimates(symbol: str, force_refresh: bool = False) -> Tuple[Optional[
             return data, []
     if OFFLINE_MODE or not FINNHUB_API_KEY:
         return None, ["Estimates unavailable offline."]
-    return None, ["Live estimates not implemented; please populate data_store/estimates manually."]
+    
+    warnings = []
+    try:
+        url = f"https://finnhub.io/api/v1/stock/recommendation?symbol={symbol}&token={FINNHUB_API_KEY}"
+        response = SESSION.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            if data:
+                write_local_json(data, local_path)
+                return data, warnings
+    except Exception as e:
+        warnings.append(f"Failed to fetch estimates: {str(e)}")
+    
+    return None, warnings
 
 
 def fetch_insiders(symbol: str, profile: Optional[dict] = None, force_refresh: bool = False) -> Tuple[Optional[dict], List[str]]:
@@ -432,7 +563,20 @@ def fetch_insiders(symbol: str, profile: Optional[dict] = None, force_refresh: b
             return data, []
     if OFFLINE_MODE or not FINNHUB_API_KEY:
         return None, ["Insider data unavailable offline."]
-    return None, ["Live insider data not implemented; please populate data_store/insiders manually."]
+    
+    warnings = []
+    try:
+        url = f"https://finnhub.io/api/v1/stock/insider-transactions?symbol={symbol}&token={FINNHUB_API_KEY}"
+        response = SESSION.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            if data and "data" in data:
+                write_local_json(data, local_path)
+                return data, warnings
+    except Exception as e:
+        warnings.append(f"Failed to fetch insider data: {str(e)}")
+    
+    return None, warnings
 
 
 __all__ = [

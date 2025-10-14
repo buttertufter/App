@@ -96,7 +96,7 @@ def to_series_1d(x, name: Optional[str] = None) -> pd.Series:
         s = x.copy()
     elif isinstance(x, pd.DataFrame):
         if x.shape[1] == 1:
-            s = x.iloc[:, 0]
+            s = pd.Series(x.iloc[:, 0].values.flatten(), index=x.index, name=name)
         else:
             s = x.mean(axis=1)
     else:

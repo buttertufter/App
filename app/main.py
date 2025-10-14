@@ -197,11 +197,17 @@ with advanced:
         max_value=2.0,
         step=0.1,
     )
-    analysis_depth = st.selectbox(
+    analysis_depth_map = {
+        "Quick (8 quarters)": {"quarters": 8, "years": 2},
+        "Standard (12 quarters)": {"quarters": 12, "years": 3},
+        "Deep (16 quarters)": {"quarters": 16, "years": 4}
+    }
+    analysis_depth_selection = st.selectbox(
         "Analysis depth",
-        options=["Quick (8 quarters)", "Standard (12 quarters)", "Deep (16 quarters)"],
+        options=list(analysis_depth_map.keys()),
         index=1,
     )
+    analysis_depth = analysis_depth_map[analysis_depth_selection]
 
 run = st.button("Compute", type="primary")
 
@@ -215,6 +221,11 @@ if run:
     profile, profile_warnings = fetch_profile(symbol, force_refresh=force_refresh)
     warnings.extend(profile_warnings)
 
+    # Fetch quarterly financials with proper depth
+    # Use the history choice config instead of analysis depth for financials
+    max_quarters = config["quarters"]  # From history_choice
+    price_years = config["years"]
+    
     try:
         q_fin, q_warn = fetch_quarterlies(symbol, force_refresh=force_refresh, max_quarters=max_quarters)
         warnings.extend(q_warn)
@@ -227,6 +238,7 @@ if run:
         st.error(f"Missing fundamental columns for {symbol}: {', '.join(missing_cols)}. Please refresh data.")
         st.stop()
 
+    # Fetch price history matching the analysis depth
     try:
         price, price_warn = fetch_prices(symbol, years=price_years, force_refresh=force_refresh)
         warnings.extend(price_warn)
@@ -248,12 +260,18 @@ if run:
         peers, peer_warn = discover_peers(symbol, UNIVERSE_DF)
     warnings.extend(peer_warn)
 
+    # Fetch peer prices with consistent time window
     peer_prices, peer_price_warn = fetch_peer_prices(peers, years=price_years, force_refresh=force_refresh)
     warnings.extend(peer_price_warn)
-    if peer_prices.empty and sector_series is not None:
-        column_name = sector_series.name or "SectorETF"
-        peer_prices = pd.DataFrame({column_name: sector_series})
-        warnings.append("Peer prices unavailable; using sector ETF as proxy.")
+    
+    # Fall back to sector ETF if peer data is unavailable
+    if peer_prices.empty:
+        sector_series, sector_warn = fetch_sector_series(symbol)
+        warnings.extend(sector_warn)
+        if sector_series is not None:
+            column_name = sector_series.name or "SectorETF"
+            peer_prices = pd.DataFrame({column_name: sector_series})
+            warnings.append("Peer prices unavailable; using sector ETF as proxy.")
 
     estimates, estimate_warn = fetch_estimates(symbol, force_refresh=force_refresh)
     warnings.extend(estimate_warn)
@@ -265,7 +283,7 @@ if run:
         "Quick (8 quarters)": {"Wq": 3, "Lq": 1},
         "Standard (12 quarters)": {"Wq": 4, "Lq": 1},
         "Deep (16 quarters)": {"Wq": 6, "Lq": 2},
-    }.get(analysis_depth, {"Wq": 4, "Lq": 1})
+    }.get(analysis_depth_selection, {"Wq": 4, "Lq": 1})
 
     wave_kappa = 3.0 + (1.0 - risk_tolerance) * 3.5
 
@@ -273,12 +291,14 @@ if run:
         st.warning("\n".join(sorted(set(warnings))))
 
     modules, wave, issues = compute_modules(
-        q_fin=q_fin,
-        price=price,
-        peer_prices=peer_prices,
-        lambdas=(lambda_debt, lambda_credit, lambda_finin),
-        kappa=wave_kappa,
-        **depth_cfg,
+        q_fin,
+        price,
+        peer_prices,
+        symbol=symbol,
+        lambdas=(float(lambda_debt), float(lambda_credit), float(lambda_finin)),
+        Wq=depth_cfg["Wq"],
+        Lq=depth_cfg["Lq"],
+        kappa=wave_kappa
     )
 
     if modules is None:
@@ -339,7 +359,7 @@ if run:
         with col:
             val = modules.get(key, {}).get("score")
             if val is None:
-                st.info(f"{module_titles[key]}\\n\\n_coming soon_", icon="i")
+                st.info(f"{module_titles[key]}\\n\\n_coming soon_", icon="ℹ️")
             else:
                 render_gauge(module_titles[key], float(val), module_help[key])
 
@@ -353,19 +373,102 @@ if run:
     else:
         st.write("No qualitative tags surfaced for this run.")
 
-    st.subheader("Revenue vs cash & financing signals")
-    rev_frame = q_fin[["Revenue", "OperatingCashFlow"]].copy()
-    if "FinancingIn" in q_fin.columns:
-        rev_frame["FinancingIn"] = q_fin["FinancingIn"]
-    rev_frame = rev_frame.dropna(how="all")
-    if not rev_frame.empty:
-        st.line_chart(rev_frame)
+    st.subheader("Revenue & Cash Flow Analysis")
+    
+    if not q_fin.empty:
+        # Show data overview and debugging information
+        st.write("### Data Availability")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            available_quarters = len(q_fin)
+            date_range = f"{q_fin.index.min().strftime('%Y-%m-%d')} to {q_fin.index.max().strftime('%Y-%m-%d')}"
+            st.info(f"Financial data available: {available_quarters} quarters\n{date_range}")
+        
+        with col2:
+            st.write("Data Points:")
+            st.write(f"• Total quarters: {len(q_fin)}")
+            st.write(f"• Start date: {q_fin.index.min().strftime('%Y-%m-%d')}")
+            st.write(f"• End date: {q_fin.index.max().strftime('%Y-%m-%d')}")
+        
+        # Debug data
+        with st.expander("Debug: Raw Data Information"):
+            st.write("Data Shape:", q_fin.shape)
+            st.write("Available Columns:", list(q_fin.columns))
+            st.write("\nQuarterly Data Sample:")
+            st.dataframe(q_fin[["Revenue", "OperatingCashFlow"]].sort_index())
+            
+        # Display data source info
+        if warnings:
+            with st.expander("Data Source Information"):
+                for warning in warnings:
+                    if "data:" in warning:
+                        st.write(f"- {warning}")
+        
+        # Create financial data frame
+        fin_data = q_fin[["Revenue", "OperatingCashFlow"]].copy()
+        fin_data.index = pd.to_datetime(fin_data.index)
+        fin_data = fin_data.sort_index()
+        
+        # Calculate TTM values
+        ttm_data = pd.DataFrame(index=fin_data.index)
+        for col in ["Revenue", "OperatingCashFlow"]:
+            # Calculate TTM (Trailing Twelve Months)
+            ttm_data[f"{col} (TTM)"] = fin_data[col].rolling(4, min_periods=4).sum()
+            # Calculate growth from first period
+            first_ttm = ttm_data[f"{col} (TTM)"].dropna().iloc[0]
+            if first_ttm and first_ttm != 0:
+                ttm_data[f"{col} Growth"] = ttm_data[f"{col} (TTM)"] / first_ttm
+        
+        # Display TTM Values
+        if not ttm_data.empty:
+            st.subheader("Trailing Twelve Months (TTM) Values")
+            ttm_values = ttm_data[[c for c in ttm_data.columns if "TTM" in c]].copy()
+            for col in ttm_values.columns:
+                ttm_values[col] = ttm_values[col] / 1e9  # Convert to billions
+                ttm_values = ttm_values.rename(columns={col: f"{col} $B"})
+            st.line_chart(ttm_values)
+            
+            # Display Growth Metrics
+            st.subheader("Growth Since First Period")
+            growth_cols = [c for c in ttm_data.columns if "Growth" in c]
+            if growth_cols:
+                st.line_chart(ttm_data[growth_cols])
+            
+            # Show latest values
+            latest = ttm_data.iloc[-1]
+            st.caption(
+                "Latest metrics (most recent quarter):\\n" +
+                "\\n".join([
+                    f"• {col.replace(' (TTM)', '')}: {val:.2f}{'x' if 'Growth' in col else 'B'}" 
+                    for col, val in latest.dropna().items()
+                ])
+            )
+        
+        # Raw data analysis in expander
+        with st.expander("View Raw Financial Data"):
+            st.dataframe(fin_data)
+            st.write("### Summary Statistics")
+            st.dataframe(fin_data.describe())
     else:
-        st.caption("Insufficient quarterly data to chart revenue and inflows.")
+        st.caption("Insufficient quarterly data to chart revenue and cash flows")
 
     if not peer_prices.empty:
-        st.subheader("Peer comparison (normalized)")
-        normalized = peer_prices.divide(peer_prices.iloc[0]).dropna(how="all")
+        st.subheader(f"Peer comparison ({price_years} years normalized)")
+        # Normalize from start of period and handle missing data
+        normalized = peer_prices.copy()
+        for col in normalized.columns:
+            clean_series = normalized[col].dropna()
+            if not clean_series.empty:
+                normalized[col] = normalized[col] / clean_series.iloc[0]
+        normalized = normalized.dropna(how="all")
+        
+        # Add main symbol price for comparison
+        if not price.empty:
+            clean_price = price.dropna()
+            if not clean_price.empty:
+                normalized[symbol] = price / clean_price.iloc[0]
+                
         st.line_chart(normalized)
     else:
         st.info(

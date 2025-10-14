@@ -30,20 +30,31 @@ except ImportError:  # pragma: no cover - fallback when utils is packaged differ
         to_series_1d,
     )
 
+from constants import (
+    FALLBACKS,
+    MIN_QUARTERS_DATA,
+    DEFAULT_QUARTERS_WINDOW,
+    VALIDATION_CONFIG,
+    MODULE_INFO  # Add MODULE_INFO import
+)
+
 
 DEBUG_SHAPES = False
 
+
+from leadership import fetch_ceo_data, fetch_insider_analysis, compute_leadership_score
 
 def compute_modules(
     q_fin: pd.DataFrame,
     price: pd.Series,
     peer_prices: pd.DataFrame,
+    symbol: str = None,
     lambdas=(0.5, 0.6, 0.8),  # debt, credit, finin
     rho=0.6,  # unused placeholder for future modelling
     theta_cp=0.2,
     kappa=4.0,
-    Wq=4,   # quarters window for TTM/derivatives
-    Lq=1,   # lag (quarters) for causal checks
+    Wq: int = 4,   # quarters window for TTM/derivatives
+    Lq: int = 1,   # lag (quarters) for causal checks
 ):
     """Compute scoring modules and overall wave score with adaptive windows.
 
@@ -122,22 +133,24 @@ def compute_modules(
         issues.append("Operating cash flow history is sparse; using revenue-based fallback.")
         OCF = R * 0.15
 
-    g_R_source = R_ttm.fillna(method="ffill")
-    if g_R_source.dropna().shape[0] >= Wq_eff:
+    # Use newer pandas fillna style with validated fallback values
+    g_R_source = R_ttm.ffill()
+    if g_R_source.dropna().shape[0] >= MIN_QUARTERS_DATA:
         g_R = slope_log(g_R_source, window=Wq_eff)
     else:
-        g_R = pd.Series(np.nan, index=g_R_source.index)
-    g_R_last = _latest("g_R", g_R, default=np.nan)
+        g_R = pd.Series(FALLBACKS["revenueGrowth"], index=g_R_source.index)
+    g_R_last = _latest("g_R", g_R, default=FALLBACKS["revenueGrowth"])
     if not np.isfinite(g_R_last):
         issues.append("Revenue momentum insufficient; set to neutral.")
-        g_R_last = 0.0
+        g_R_last = FALLBACKS["revenue_growth"]
 
-    a_R_source = g_R.fillna(method="ffill")
-    if a_R_source.dropna().shape[0] >= Wq_eff:
+    # Use newer pandas fillna style with validated fallback values
+    a_R_source = g_R.ffill()
+    if a_R_source.dropna().shape[0] >= MIN_QUARTERS_DATA:
         a_R = slope_log(a_R_source, window=Wq_eff)
     else:
-        a_R = pd.Series(np.nan, index=a_R_source.index)
-    a_R_last = _latest("a_R", a_R, default=np.nan)
+        a_R = pd.Series(FALLBACKS["revenueAcceleration"], index=a_R_source.index)
+    a_R_last = _latest("a_R", a_R, default=FALLBACKS["revenueAcceleration"])
     if not np.isfinite(a_R_last):
         issues.append("Revenue acceleration insufficient; set to neutral.")
         a_R_last = 0.0
@@ -268,14 +281,16 @@ def compute_modules(
     Q_cp = s(CP - theta_cp)
     Q_mom = s(g_R_last)
     Q_acc = s(a_R_last)
-    A = gmean([Q_supp, Q_ops, Q_cp, Q_mom, Q_acc], [2, 2, 2, 1, 1])
+    module_a_weights = MODULE_INFO["A"]["weights"]
+    A = gmean([Q_supp, Q_ops, Q_cp, Q_mom, Q_acc], module_a_weights)
 
     Q_stab = s(tau - sigma_R)
     Q_coh = gmean([(1 + corr_cash) / 2, (1 + corr_fin) / 2], [1, 1])
     liq = cash / max(E, EPS)
     nd = max(debt - cash, 0.0) / max(R, EPS)
     Q_liq, Q_nd = s(liq), s(-nd)
-    B = gmean([Q_stab, Q_coh, Q_liq, Q_nd], [2, 1, 1, 1])
+    module_b_weights = MODULE_INFO["B"]["weights"]
+    B = gmean([Q_stab, Q_coh, Q_liq, Q_nd], module_b_weights)
 
     C = None
 
@@ -283,15 +298,84 @@ def compute_modules(
     Q_align = 1.0 - max(0.0, s(gP_lag_val) - s(g_R_last))
     D = float(np.sqrt(max(Q_sector, 0.0) * max(Q_align, 0.0)))
 
-    E_mod = gmean([s(-idio_vol), Q_align], [1, 1])
+    module_e_weights = MODULE_INFO["E"]["weights"]
+    E_mod = gmean([s(-idio_vol), Q_align], module_e_weights)
 
-    wave_core = gmean([A, B, (C if C is not None else 0.5), D, E_mod], [1, 1, 1, 1, 1])
+    # Use leadership score with fallback
+    leadership_score = FALLBACKS.get("leadershipScore", 0.5)
+    if symbol:
+        try:
+            ceo_data, ceo_warns = fetch_ceo_data(symbol)
+            insider_data, insider_warns = fetch_insider_analysis(symbol)
+            
+            issues.extend(ceo_warns)
+            issues.extend(insider_warns)
+            
+            # Pass through normalized growth and margin data
+            historical_growth = g_R_last if np.isfinite(g_R_last) else None
+            profit_margin = m_op if np.isfinite(m_op) else None
+            
+            leadership_score, leadership_warns = compute_leadership_score(
+                ceo_data,
+                insider_data,
+                historical_growth,
+                profit_margin
+            )
+            issues.extend(leadership_warns)
+            
+        except Exception as e:
+            issues.append(f"Leadership analysis failed: {str(e)}")
+    
+    C = leadership_score
+    # All modules have equal weight in the final wave score
+    module_weights = [1] * 5  # [A, B, C, D, E] weights
+    wave_core = gmean([A, B, C, D, E_mod], module_weights)
     wave = wave_core ** 1.15
+
+    # Compute leadership score if symbol is provided
+    leadership_score = 0.5  # neutral default
+    leadership_tags = []
+    leadership_explains = ["Tenure", "Growth", "Margins", "Insiders"]
+    
+    if symbol:
+        try:
+            # Fetch leadership and insider data
+            ceo_data, ceo_warnings = fetch_ceo_data(symbol)
+            insider_data, insider_warnings = fetch_insider_analysis(symbol)
+            
+            # Add any warnings to issues list
+            issues.extend(ceo_warnings)
+            issues.extend(insider_warnings)
+            
+            # Calculate historical growth and profit margins
+            historical_growth = g_R_last if np.isfinite(g_R_last) else None
+            profit_margin = m_op if np.isfinite(m_op) else None
+            
+            # Compute leadership score
+            leadership_score, leadership_warns = compute_leadership_score(
+                ceo_data, 
+                insider_data,
+                historical_growth,
+                profit_margin
+            )
+            issues.extend(leadership_warns)
+            
+            # Add relevant tags
+            if ceo_data and ceo_data.get("ceo_name"):
+                leadership_tags.append(f"CEO: {ceo_data['ceo_name']}")
+            if insider_data and insider_data.get("insider_confidence", {}).get("net_transactions", 0) > 0:
+                leadership_tags.append("Net insider buying")
+            elif insider_data and insider_data.get("insider_confidence", {}).get("net_transactions", 0) < 0:
+                leadership_tags.append("Net insider selling")
+                
+        except Exception as e:
+            issues.append(f"Leadership score computation failed: {str(e)}")
+            leadership_score = 0.5  # fallback to neutral
 
     modules = {
         "A": {"score": round(A, 4), "explain": ["Growth", "Accel", "Margins", "CP", "Support"], "tags": []},
         "B": {"score": round(B, 4), "explain": ["Stability", "Coherence", "Liquidity", "NetDebt"], "tags": []},
-        "C": {"score": None, "explain": ["Insiders", "Comp", "Guidance", "Buybacks"], "tags": ["coming soon"]},
+        "C": {"score": round(leadership_score, 4), "explain": leadership_explains, "tags": leadership_tags},
         "D": {"score": round(D, 4), "explain": ["Sector", "Alignment"], "tags": []},
         "E": {"score": round(E_mod, 4), "explain": ["IdioVol", "Align"], "tags": []},
     }
