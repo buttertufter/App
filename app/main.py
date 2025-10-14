@@ -8,7 +8,7 @@ import streamlit as st
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
-from data import (  # noqa: E402  # isort:skip
+from data import (
     discover_peers,
     dotenv_status,
     fetch_estimates,
@@ -19,6 +19,11 @@ from data import (  # noqa: E402  # isort:skip
     fetch_quarterlies,
     fetch_sector_series,
     get_universe,
+    OFFLINE_MODE,      # <-- ADD THIS
+    REQUIRED_COLUMNS,  # <-- ADD THIS
+    DATA_STORE,        # <-- ADD THIS
+    PROJECT_ROOT,      # <-- BEST PRACTICE
+    CACHE_DIR,         # <-- BEST PRACTICE
 )
 from model import compute_modules  # noqa: E402  # isort:skip
 from utils import file_age_days
